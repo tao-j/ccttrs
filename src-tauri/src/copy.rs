@@ -1,11 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 // No longer used dynamically but kept for dependency parity
-use std::time::{SystemTime, Instant};
+use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::io::Read;
 use std::time::Duration;
+use std::time::{Instant, SystemTime};
 use uuid::Uuid;
 
 use crate::state::SdCardProfile;
@@ -33,16 +33,25 @@ pub struct FileMeta {
 }
 
 #[tauri::command]
-pub async fn list_media_files(sd_path: String, profile_type: String) -> Result<Vec<FileMeta>, String> {
+pub async fn list_media_files(
+    sd_path: String,
+    profile_type: String,
+) -> Result<Vec<FileMeta>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut files = Vec::new();
         let root = Path::new(&sd_path);
         scan_media_paths(root, &profile_type, &mut files)?;
-        
+
         // Sort descending by modified time
-        files.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| b.name.cmp(&a.name)));
+        files.sort_by(|a, b| {
+            b.modified
+                .cmp(&a.modified)
+                .then_with(|| b.name.cmp(&a.name))
+        });
         Ok(files)
-    }).await.map_err(|e| e.to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 pub fn run_sync(
@@ -56,14 +65,19 @@ pub fn run_sync(
 
     // Sort by modified time, then by filename
     files.sort_by(|a, b| {
-        a.modified.cmp(&b.modified).then_with(|| a.name.cmp(&b.name))
+        a.modified
+            .cmp(&b.modified)
+            .then_with(|| a.name.cmp(&b.name))
     });
 
     // Filter files that are "new"
-    let new_files: Vec<_> = if let (Some(last_path), Some(last_ts)) = (&profile.last_file_path, profile.last_file_timestamp) {
-        files.into_iter().filter(|f| {
-            f.modified > last_ts || (f.modified == last_ts && f.name > *last_path)
-        }).collect()
+    let new_files: Vec<_> = if let (Some(last_path), Some(last_ts)) =
+        (&profile.last_file_path, profile.last_file_timestamp)
+    {
+        files
+            .into_iter()
+            .filter(|f| f.modified > last_ts || (f.modified == last_ts && f.name > *last_path))
+            .collect()
     } else {
         files
     };
@@ -104,7 +118,7 @@ pub fn run_sync(
                 let current_bytes = reporter_bytes_copied.load(Ordering::Relaxed);
                 let current_true = reporter_true_bytes.load(Ordering::Relaxed);
                 let filename = reporter_current_filename.lock().unwrap().clone();
-                
+
                 on_progress_ref(CopyProgress {
                     files_copied: current_count,
                     files_skipped: current_skipped,
@@ -120,53 +134,57 @@ pub fn run_sync(
         });
 
         // Run sequential IO block on current thread
-        let res: Vec<_> = new_files.iter().map(|f| {
-            if cancel_flag.load(Ordering::Relaxed) {
-                return Err("Cancelled by user".to_string());
-            }
+        let res: Vec<_> = new_files
+            .iter()
+            .map(|f| {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Err("Cancelled by user".to_string());
+                }
 
-            let file_name = f.path.file_name().unwrap().to_string_lossy().into_owned();
-            let mut dest_path = staging_dir.join(&file_name);
-            
-            let mut should_copy = true;
+                let file_name = f.path.file_name().unwrap().to_string_lossy().into_owned();
+                let dest_file_name = destination_file_name(&file_name, profile);
+                let mut dest_path = staging_dir.join(&dest_file_name);
 
-            if dest_path.exists() {
-                if let Ok(dest_meta) = fs::metadata(&dest_path) {
-                    if dest_meta.len() == f.size {
-                        should_copy = false;
-                    } else {
-                        dest_path = append_uuid(&dest_path);
+                let mut should_copy = true;
+
+                if dest_path.exists() {
+                    if let Ok(dest_meta) = fs::metadata(&dest_path) {
+                        if dest_meta.len() == f.size {
+                            should_copy = false;
+                        } else {
+                            dest_path = append_uuid(&dest_path);
+                        }
                     }
                 }
-            }
 
-            if should_copy {
-                if let Err(e) = fs::copy(&f.path, &dest_path) {
-                    return Err(e.to_string());
+                if should_copy {
+                    if let Err(e) = fs::copy(&f.path, &dest_path) {
+                        return Err(e.to_string());
+                    }
+                    let _ = true_bytes_copied.fetch_add(f.size as usize, Ordering::SeqCst);
+                } else {
+                    let _ = skipped_count.fetch_add(1, Ordering::SeqCst);
                 }
-                let _ = true_bytes_copied.fetch_add(f.size as usize, Ordering::SeqCst);
-            } else {
-                let _ = skipped_count.fetch_add(1, Ordering::SeqCst);
-            }
-            
-            let _ = copied_count.fetch_add(1, Ordering::SeqCst);
-            let _ = bytes_copied.fetch_add(f.size as usize, Ordering::SeqCst);
-            
-            if let Ok(mut name_lock) = current_filename.lock() {
-                *name_lock = file_name.clone();
-            }
 
-            Ok(f)
-        }).collect();
+                let _ = copied_count.fetch_add(1, Ordering::SeqCst);
+                let _ = bytes_copied.fetch_add(f.size as usize, Ordering::SeqCst);
+
+                if let Ok(mut name_lock) = current_filename.lock() {
+                    *name_lock = dest_file_name.clone();
+                }
+
+                Ok(f)
+            })
+            .collect();
 
         is_done.store(true, Ordering::Relaxed);
-        
+
         let final_count = copied_count.load(Ordering::Relaxed);
         let final_skipped = skipped_count.load(Ordering::Relaxed);
         let final_bytes = bytes_copied.load(Ordering::Relaxed);
         let final_true = true_bytes_copied.load(Ordering::Relaxed);
         let filename = current_filename.lock().unwrap().clone();
-        
+
         // Final emit 100%
         on_progress(CopyProgress {
             files_copied: final_count,
@@ -187,15 +205,17 @@ pub fn run_sync(
     for res in results.iter() {
         match res {
             Ok(f) => {
-                if last_success.is_none() || f.modified > last_success.as_ref().unwrap().modified || (f.modified == last_success.as_ref().unwrap().modified && f.name > last_success.as_ref().unwrap().name) {
+                if last_success.is_none()
+                    || f.modified > last_success.as_ref().unwrap().modified
+                    || (f.modified == last_success.as_ref().unwrap().modified
+                        && f.name > last_success.as_ref().unwrap().name)
+                {
                     last_success = Some(f);
                 }
             }
             Err(e) => return Err(e.to_string()),
         }
     }
-
-
 
     // Update profile
     if let Some(f) = last_success {
@@ -212,7 +232,7 @@ fn compute_md5(path: &Path) -> Option<[u8; 16]> {
     let mut file = fs::File::open(path).ok()?;
     let mut context = md5::Context::new();
     let mut buffer = [0; 4 * 1024 * 1024]; // 4MB chunk buffer
-    
+
     loop {
         let count = file.read(&mut buffer).ok()?;
         if count == 0 {
@@ -220,7 +240,7 @@ fn compute_md5(path: &Path) -> Option<[u8; 16]> {
         }
         context.consume(&buffer[..count]);
     }
-    
+
     Some(context.finalize().into())
 }
 
@@ -228,17 +248,41 @@ fn append_uuid(path: &Path) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    
+
     let uuid_str = Uuid::new_v4().to_string();
     let unique = uuid_str.split('-').next().unwrap_or("dup");
-    
+
     let new_name = if ext.is_empty() {
         format!("{}_{}", stem, unique)
     } else {
         format!("{}_{}.{}", stem, unique, ext)
     };
-    
+
     parent.join(new_name)
+}
+
+fn destination_file_name(source_file_name: &str, profile: &SdCardProfile) -> String {
+    if profile.profile_type == "Nikon" && profile.rename_nev_to_r3d {
+        rename_extension_case_insensitive(source_file_name, "NEV", "R3D")
+    } else {
+        source_file_name.to_string()
+    }
+}
+
+fn rename_extension_case_insensitive(file_name: &str, from: &str, to: &str) -> String {
+    let path = Path::new(file_name);
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return file_name.to_string();
+    };
+
+    if !ext.eq_ignore_ascii_case(from) {
+        return file_name.to_string();
+    }
+
+    match path.file_stem().and_then(|stem| stem.to_str()) {
+        Some(stem) => format!("{}.{}", stem, to),
+        None => file_name.to_string(),
+    }
 }
 
 fn find_case_insensitive_path(root: &Path, components: &[&str]) -> Option<PathBuf> {
@@ -263,15 +307,19 @@ fn find_case_insensitive_path(root: &Path, components: &[&str]) -> Option<PathBu
     Some(current)
 }
 
-fn scan_media_paths(root: &Path, profile_type: &str, files: &mut Vec<FileMeta>) -> Result<(), String> {
+fn scan_media_paths(
+    root: &Path,
+    profile_type: &str,
+    files: &mut Vec<FileMeta>,
+) -> Result<(), String> {
     let mut paths_to_scan = Vec::new();
-    
+
     if let Some(dcim) = find_case_insensitive_path(root, &["DCIM"]) {
         if dcim.is_dir() {
             paths_to_scan.push(dcim);
         }
     }
-    
+
     if profile_type == "Sony" {
         if let Some(clip) = find_case_insensitive_path(root, &["PRIVATE", "M4ROOT", "CLIP"]) {
             if clip.is_dir() {
@@ -279,11 +327,11 @@ fn scan_media_paths(root: &Path, profile_type: &str, files: &mut Vec<FileMeta>) 
             }
         }
     }
-    
+
     for path in paths_to_scan {
         scan_dir_recursive(&path, files)?;
     }
-    
+
     Ok(())
 }
 
@@ -312,18 +360,71 @@ fn scan_dir_recursive(dir: &Path, files: &mut Vec<FileMeta>) -> Result<(), Strin
                 Err(_) => continue, // Skip files we cannot query metadata for
             };
 
-            let modified = metadata.modified()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+            let modified = metadata
+                .modified()
+                .and_then(|t| {
+                    t.duration_since(SystemTime::UNIX_EPOCH)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                })
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
             files.push(FileMeta {
                 path: path.clone(),
-                name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                name: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
                 size: metadata.len(),
                 modified,
             });
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(profile_type: &str, rename_nev_to_r3d: bool) -> SdCardProfile {
+        SdCardProfile {
+            id: "test".to_string(),
+            profile_type: profile_type.to_string(),
+            volume_name: "card".to_string(),
+            staging_dir: "/tmp/staging".to_string(),
+            last_file_path: None,
+            last_file_timestamp: None,
+            rename_nev_to_r3d,
+        }
+    }
+
+    #[test]
+    fn nikon_profile_renames_nev_to_r3d() {
+        assert_eq!(
+            destination_file_name("A001C001.NEV", &profile("Nikon", true)),
+            "A001C001.R3D"
+        );
+        assert_eq!(
+            destination_file_name("A001C001.nev", &profile("Nikon", true)),
+            "A001C001.R3D"
+        );
+    }
+
+    #[test]
+    fn non_nikon_or_disabled_profile_keeps_original_name() {
+        assert_eq!(
+            destination_file_name("A001C001.NEV", &profile("Sony", true)),
+            "A001C001.NEV"
+        );
+        assert_eq!(
+            destination_file_name("A001C001.NEV", &profile("Nikon", false)),
+            "A001C001.NEV"
+        );
+        assert_eq!(
+            destination_file_name("A001C001.MOV", &profile("Nikon", true)),
+            "A001C001.MOV"
+        );
+    }
 }

@@ -21,6 +21,7 @@ Disk scanning, hardware device listing, directory parsing, and file transfers ar
 ### 3. Dual-Structure DCIM & Sony XAVC-S Support
 Standard camera structures store everything under `/DCIM`. However, modern mirrorless systems (such as Sony Alpha series) store high-quality video files separately (e.g., in `/PRIVATE/M4ROOT/CLIP/` alongside XML metadata).
 - CCTTRS includes specialized camera profiles (e.g., **Sony DCIM + PRIVATE** vs. **Generic DCIM-only**) to automatically discover and merge multiple deep media folders into a unified transfer list.
+- Nikon profiles can optionally rename copied `.NEV` files to `.R3D`. The option is enabled by default and can be changed per card profile.
 
 ### 4. Glassmorphic Immersive Design
 The visual interface of CCTTRS features a premium, state-of-the-art layout designed to feel premium and alive:
@@ -109,6 +110,8 @@ To compile the production-ready optimized native installer:
 npm run tauri build
 ```
 This generates standard installer packages (`.dmg` for macOS, `.msi` or `.exe` for Windows, `.deb` or `.appimage` for Linux) inside the `src-tauri/target/release/bundle/` directory.
+
+macOS app bundles are ad-hoc signed by default. For trusted external distribution, replace the ad-hoc identity with a Developer ID Application certificate and configure Apple notarization credentials in the build environment.
 
 ---
 

@@ -12,6 +12,7 @@ interface SdCardProfile {
   staging_dir: string;
   last_file_path: string | null;
   last_file_timestamp: number | null;
+  rename_nev_to_r3d?: boolean;
 }
 
 interface ProgressPayload {
@@ -79,6 +80,7 @@ function CardTask({
   const [stagingDir, setStagingDir] = useState("");
   const [profileType, setProfileType] = useState("Sony"); 
   const [volumeName, setVolumeName] = useState(initialVolumeName);
+  const [renameNevToR3d, setRenameNevToR3d] = useState(true);
 
   const [profile, setProfile] = useState<SdCardProfile | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
@@ -150,6 +152,7 @@ function CardTask({
       }
       setProfileType(p.profile_type);
       setVolumeName(p.volume_name);
+      setRenameNevToR3d(p.rename_nev_to_r3d ?? true);
       if (onProfileStatusChange) onProfileStatusChange(sdPath, true);
     } catch (e: any) {
       setProfile(null);
@@ -211,6 +214,7 @@ function CardTask({
         stagingDir,
         lastFilePath: last_file_path,
         lastFileTimestamp: last_file_timestamp,
+        renameNevToR3d,
       });
 
       setProfile(p);
@@ -368,7 +372,7 @@ function CardTask({
           <h3 style={{marginTop: 0, marginBottom: '1rem', fontSize: '1rem', color: '#f8fafc'}}>
              {isEditing ? "Edit Card Profile" : "Initialize New Card"}
           </h3>
-                   <div className="form-group">
+          <div className="form-group">
             <label>Camera Brand / Hierarchy Type</label>
             <select 
               value={profileType}
@@ -379,6 +383,21 @@ function CardTask({
                 <option value="Nikon">Nikon / Canon / Generic (DCIM/ only)</option>
             </select>
           </div>
+
+          {profileType === "Nikon" && (
+            <div className="form-group">
+              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: isCopying ? 'default' : 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={renameNevToR3d}
+                  onChange={(e) => setRenameNevToR3d(e.target.checked)}
+                  disabled={isCopying}
+                  style={{ width: 'auto', margin: 0 }}
+                />
+                Rename Nikon .NEV files to .R3D during copy
+              </label>
+            </div>
+          )}
 
           <div className="form-group">
             <label>Staging Directory</label>
@@ -503,6 +522,14 @@ function CardTask({
                 <span style={{color: '#94a3b8', marginRight: '6px'}}>Type:</span>
                 <span style={{color: '#38bdf8'}}>{profile.profile_type}</span>
               </div>
+              {profile.profile_type === "Nikon" && (
+                <div>
+                  <span style={{color: '#94a3b8', marginRight: '6px'}}>NEV Rename:</span>
+                  <span style={{color: '#38bdf8'}}>
+                    {(profile.rename_nev_to_r3d ?? true) ? "On" : "Off"}
+                  </span>
+                </div>
+              )}
               <div style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                 <span style={{color: '#94a3b8', marginRight: '6px'}}>Staging:</span>
                 <span style={{color: stagingDir === profile.staging_dir ? '#38bdf8' : '#fbbf24'}}>

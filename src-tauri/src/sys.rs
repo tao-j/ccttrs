@@ -1,6 +1,6 @@
-use sysinfo::Disks;
 use serde::Serialize;
 use std::path::PathBuf;
+use sysinfo::Disks;
 
 #[derive(Serialize)]
 pub struct DeviceInfo {
@@ -32,7 +32,9 @@ pub async fn list_devices() -> Result<Vec<DeviceInfo>, String> {
         }
 
         Ok(devices)
-    }).await.map_err(|e| e.to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -78,7 +80,7 @@ pub async fn eject_device(mount_point: String) -> Result<(), String> {
                 let output = std::process::Command::new("udisksctl")
                     .args(["unmount", "-b", &dev])
                     .output();
-                
+
                 if let Ok(out) = output {
                     if out.status.success() {
                         return Ok(());
