@@ -43,6 +43,7 @@ async fn init_profile(
     last_file_path: Option<String>,
     last_file_timestamp: Option<u64>,
     rename_nev_to_r3d: Option<bool>,
+    skip_nikon_proxy_mp4: Option<bool>,
 ) -> Result<SdCardProfile, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let profile = SdCardProfile::new(
@@ -52,6 +53,7 @@ async fn init_profile(
             last_file_path,
             last_file_timestamp,
             rename_nev_to_r3d.unwrap_or(true),
+            skip_nikon_proxy_mp4.unwrap_or(true),
         );
         profile.save_to_sd(Path::new(&sd_path))?;
         Ok(profile)

@@ -13,6 +13,8 @@ pub struct SdCardProfile {
     pub last_file_timestamp: Option<u64>,
     #[serde(default = "default_rename_nev_to_r3d")]
     pub rename_nev_to_r3d: bool,
+    #[serde(default = "default_skip_nikon_proxy_mp4")]
+    pub skip_nikon_proxy_mp4: bool,
 }
 
 impl SdCardProfile {
@@ -23,6 +25,7 @@ impl SdCardProfile {
         last_file_path: Option<String>,
         last_file_timestamp: Option<u64>,
         rename_nev_to_r3d: bool,
+        skip_nikon_proxy_mp4: bool,
     ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -32,6 +35,7 @@ impl SdCardProfile {
             last_file_path,
             last_file_timestamp,
             rename_nev_to_r3d,
+            skip_nikon_proxy_mp4,
         }
     }
 
@@ -55,6 +59,10 @@ fn default_rename_nev_to_r3d() -> bool {
     true
 }
 
+fn default_skip_nikon_proxy_mp4() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +82,6 @@ mod tests {
         .unwrap();
 
         assert!(profile.rename_nev_to_r3d);
+        assert!(profile.skip_nikon_proxy_mp4);
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 // No longer used dynamically but kept for dependency parity
@@ -36,11 +37,17 @@ pub struct FileMeta {
 pub async fn list_media_files(
     sd_path: String,
     profile_type: String,
+    skip_nikon_proxy_mp4: Option<bool>,
 ) -> Result<Vec<FileMeta>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut files = Vec::new();
         let root = Path::new(&sd_path);
-        scan_media_paths(root, &profile_type, &mut files)?;
+        scan_media_paths(
+            root,
+            &profile_type,
+            skip_nikon_proxy_mp4.unwrap_or(true),
+            &mut files,
+        )?;
 
         // Sort descending by modified time
         files.sort_by(|a, b| {
@@ -61,7 +68,12 @@ pub fn run_sync(
     on_progress: impl Fn(CopyProgress) + Send + Sync,
 ) -> Result<(), String> {
     let mut files = Vec::new();
-    scan_media_paths(sd_root, &profile.profile_type, &mut files)?;
+    scan_media_paths(
+        sd_root,
+        &profile.profile_type,
+        profile.skip_nikon_proxy_mp4,
+        &mut files,
+    )?;
 
     // Sort by modified time, then by filename
     files.sort_by(|a, b| {
@@ -310,6 +322,7 @@ fn find_case_insensitive_path(root: &Path, components: &[&str]) -> Option<PathBu
 fn scan_media_paths(
     root: &Path,
     profile_type: &str,
+    skip_nikon_proxy_mp4: bool,
     files: &mut Vec<FileMeta>,
 ) -> Result<(), String> {
     let mut paths_to_scan = Vec::new();
@@ -329,28 +342,37 @@ fn scan_media_paths(
     }
 
     for path in paths_to_scan {
-        scan_dir_recursive(&path, files)?;
+        scan_dir_recursive(&path, profile_type, skip_nikon_proxy_mp4, files)?;
     }
 
     Ok(())
 }
 
-fn scan_dir_recursive(dir: &Path, files: &mut Vec<FileMeta>) -> Result<(), String> {
+fn scan_dir_recursive(
+    dir: &Path,
+    profile_type: &str,
+    skip_nikon_proxy_mp4: bool,
+    files: &mut Vec<FileMeta>,
+) -> Result<(), String> {
     if !dir.is_dir() {
         return Ok(());
     }
 
-    let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
+    let entries: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .map(|entry| entry.map(|entry| entry.path()).map_err(|e| e.to_string()))
+        .collect::<Result<_, _>>()?;
+    let proxy_video_stems = proxy_video_stems(profile_type, skip_nikon_proxy_mp4, &entries);
 
+    for path in entries {
         if path.is_dir() {
-            scan_dir_recursive(&path, files)?;
+            scan_dir_recursive(&path, profile_type, skip_nikon_proxy_mp4, files)?;
         } else {
             // Ignore hidden files like .ccttrs.json etc.
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') {
+                if name.starts_with('.')
+                    || should_skip_media_file(profile_type, name, &proxy_video_stems)
+                {
                     continue;
                 }
             }
@@ -384,9 +406,59 @@ fn scan_dir_recursive(dir: &Path, files: &mut Vec<FileMeta>) -> Result<(), Strin
     Ok(())
 }
 
+fn proxy_video_stems(
+    profile_type: &str,
+    skip_nikon_proxy_mp4: bool,
+    entries: &[PathBuf],
+) -> HashSet<String> {
+    if profile_type != "Nikon" || !skip_nikon_proxy_mp4 {
+        return HashSet::new();
+    }
+
+    entries
+        .iter()
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            let ext = path.extension()?.to_str()?;
+            if !ext.eq_ignore_ascii_case("NEV") && !ext.eq_ignore_ascii_case("R3D") {
+                return None;
+            }
+
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| stem.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn should_skip_media_file(
+    profile_type: &str,
+    file_name: &str,
+    proxy_video_stems: &HashSet<String>,
+) -> bool {
+    if profile_type == "Nikon" && file_name.eq_ignore_ascii_case("NC_FLLST.DAT") {
+        return true;
+    }
+
+    let path = Path::new(file_name);
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+
+    if !ext.eq_ignore_ascii_case("MP4") {
+        return false;
+    }
+
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| proxy_video_stems.contains(&stem.to_ascii_lowercase()))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn profile(profile_type: &str, rename_nev_to_r3d: bool) -> SdCardProfile {
         SdCardProfile {
@@ -397,6 +469,7 @@ mod tests {
             last_file_path: None,
             last_file_timestamp: None,
             rename_nev_to_r3d,
+            skip_nikon_proxy_mp4: true,
         }
     }
 
@@ -426,5 +499,88 @@ mod tests {
             destination_file_name("A001C001.MOV", &profile("Nikon", true)),
             "A001C001.MOV"
         );
+    }
+
+    #[test]
+    fn nikon_profile_skips_nc_fllst_dat() {
+        let root = make_temp_card("nikon_skip");
+        let dcim = root.join("DCIM").join("100NIKON");
+        fs::create_dir_all(&dcim).unwrap();
+        write_file(&dcim.join("NC_FLLST.DAT"));
+        write_file(&dcim.join("A001C001.NEV"));
+
+        let mut files = Vec::new();
+        scan_media_paths(&root, "Nikon", true, &mut files).unwrap();
+
+        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["A001C001.NEV"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_nikon_profile_keeps_nc_fllst_dat() {
+        let root = make_temp_card("sony_keep");
+        let dcim = root.join("DCIM");
+        fs::create_dir_all(&dcim).unwrap();
+        write_file(&dcim.join("NC_FLLST.DAT"));
+
+        let mut files = Vec::new();
+        scan_media_paths(&root, "Sony", true, &mut files).unwrap();
+
+        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["NC_FLLST.DAT"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nikon_profile_skips_same_stem_proxy_mp4_when_enabled() {
+        let root = make_temp_card("nikon_proxy_skip");
+        let dcim = root.join("DCIM").join("100NIKON");
+        fs::create_dir_all(&dcim).unwrap();
+        write_file(&dcim.join("A001C001.NEV"));
+        write_file(&dcim.join("A001C001.MP4"));
+        write_file(&dcim.join("A001C002.R3D"));
+        write_file(&dcim.join("A001C002.mp4"));
+        write_file(&dcim.join("A001C003.MP4"));
+
+        let mut files = Vec::new();
+        scan_media_paths(&root, "Nikon", true, &mut files).unwrap();
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["A001C001.NEV", "A001C002.R3D", "A001C003.MP4"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nikon_profile_keeps_same_stem_proxy_mp4_when_disabled() {
+        let root = make_temp_card("nikon_proxy_keep");
+        let dcim = root.join("DCIM").join("100NIKON");
+        fs::create_dir_all(&dcim).unwrap();
+        write_file(&dcim.join("A001C001.NEV"));
+        write_file(&dcim.join("A001C001.MP4"));
+
+        let mut files = Vec::new();
+        scan_media_paths(&root, "Nikon", false, &mut files).unwrap();
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["A001C001.MP4", "A001C001.NEV"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn make_temp_card(prefix: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ccttrs_{}_{}", prefix, Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_file(path: &Path) {
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(b"test").unwrap();
     }
 }

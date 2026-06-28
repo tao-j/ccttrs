@@ -13,6 +13,7 @@ interface SdCardProfile {
   last_file_path: string | null;
   last_file_timestamp: number | null;
   rename_nev_to_r3d?: boolean;
+  skip_nikon_proxy_mp4?: boolean;
 }
 
 interface ProgressPayload {
@@ -81,6 +82,7 @@ function CardTask({
   const [profileType, setProfileType] = useState("Sony"); 
   const [volumeName, setVolumeName] = useState(initialVolumeName);
   const [renameNevToR3d, setRenameNevToR3d] = useState(true);
+  const [skipNikonProxyMp4, setSkipNikonProxyMp4] = useState(true);
 
   const [profile, setProfile] = useState<SdCardProfile | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
@@ -153,6 +155,7 @@ function CardTask({
       setProfileType(p.profile_type);
       setVolumeName(p.volume_name);
       setRenameNevToR3d(p.rename_nev_to_r3d ?? true);
+      setSkipNikonProxyMp4(p.skip_nikon_proxy_mp4 ?? true);
       if (onProfileStatusChange) onProfileStatusChange(sdPath, true);
     } catch (e: any) {
       setProfile(null);
@@ -160,15 +163,19 @@ function CardTask({
       const msg = typeof e === "string" ? e : "Unknown error";
       setErrorMsg(msg);
       if (msg === "Profile not found on SD card" || msg.includes("No such file")) {
-        fetchMediaFiles(profileType);
+        fetchMediaFiles(profileType, skipNikonProxyMp4);
       }
     }
   }
 
-  async function fetchMediaFiles(type: string) {
+  async function fetchMediaFiles(type: string, skipProxyMp4 = skipNikonProxyMp4) {
     setIsFetchingFiles(true);
     try {
-      const files = await invoke<FileMeta[]>("list_media_files", { sdPath, profileType: type });
+      const files = await invoke<FileMeta[]>("list_media_files", {
+        sdPath,
+        profileType: type,
+        skipNikonProxyMp4: skipProxyMp4,
+      });
       setAvailableFiles(files);
       if (files.length > 0) {
          setSelectedStartFile(""); 
@@ -181,10 +188,10 @@ function CardTask({
   }
 
   useEffect(() => {
-     if (!profile && sdPath && errorMsg) {
-         fetchMediaFiles(profileType);
+     if (sdPath && ((!profile && errorMsg) || isEditing)) {
+         fetchMediaFiles(profileType, skipNikonProxyMp4);
      }
-  }, [profileType]);
+  }, [profileType, skipNikonProxyMp4]);
 
   async function handleInitProfile() {
     setErrorMsg("");
@@ -215,6 +222,7 @@ function CardTask({
         lastFilePath: last_file_path,
         lastFileTimestamp: last_file_timestamp,
         renameNevToR3d,
+        skipNikonProxyMp4,
       });
 
       setProfile(p);
@@ -324,7 +332,7 @@ function CardTask({
                 title="Edit Settings"
                 style={{ background: 'rgba(255,255,255,0.1)', padding: '0.5rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                 onClick={() => {
-                  fetchMediaFiles(profileType);
+                  fetchMediaFiles(profileType, skipNikonProxyMp4);
                   setIsEditing(true);
                   setErrorMsg("");
                 }}
@@ -385,18 +393,32 @@ function CardTask({
           </div>
 
           {profileType === "Nikon" && (
-            <div className="form-group">
-              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: isCopying ? 'default' : 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={renameNevToR3d}
-                  onChange={(e) => setRenameNevToR3d(e.target.checked)}
-                  disabled={isCopying}
-                  style={{ width: 'auto', margin: 0 }}
-                />
-                Rename Nikon .NEV files to .R3D during copy
-              </label>
-            </div>
+            <>
+              <div className="form-group">
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: isCopying ? 'default' : 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={renameNevToR3d}
+                    onChange={(e) => setRenameNevToR3d(e.target.checked)}
+                    disabled={isCopying}
+                    style={{ width: 'auto', margin: 0 }}
+                  />
+                  Rename Nikon .NEV files to .R3D during copy
+                </label>
+              </div>
+              <div className="form-group">
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: isCopying ? 'default' : 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={skipNikonProxyMp4}
+                    onChange={(e) => setSkipNikonProxyMp4(e.target.checked)}
+                    disabled={isCopying}
+                    style={{ width: 'auto', margin: 0 }}
+                  />
+                  Skip Nikon same-name .MP4 proxy files when .NEV/.R3D exists
+                </label>
+              </div>
+            </>
           )}
 
           <div className="form-group">
@@ -523,12 +545,20 @@ function CardTask({
                 <span style={{color: '#38bdf8'}}>{profile.profile_type}</span>
               </div>
               {profile.profile_type === "Nikon" && (
-                <div>
-                  <span style={{color: '#94a3b8', marginRight: '6px'}}>NEV Rename:</span>
-                  <span style={{color: '#38bdf8'}}>
-                    {(profile.rename_nev_to_r3d ?? true) ? "On" : "Off"}
-                  </span>
-                </div>
+                <>
+                  <div>
+                    <span style={{color: '#94a3b8', marginRight: '6px'}}>NEV Rename:</span>
+                    <span style={{color: '#38bdf8'}}>
+                      {(profile.rename_nev_to_r3d ?? true) ? "On" : "Off"}
+                    </span>
+                  </div>
+                  <div>
+                    <span style={{color: '#94a3b8', marginRight: '6px'}}>Proxy MP4 Skip:</span>
+                    <span style={{color: '#38bdf8'}}>
+                      {(profile.skip_nikon_proxy_mp4 ?? true) ? "On" : "Off"}
+                    </span>
+                  </div>
+                </>
               )}
               <div style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                 <span style={{color: '#94a3b8', marginRight: '6px'}}>Staging:</span>
