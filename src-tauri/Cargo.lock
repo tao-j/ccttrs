@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "ccttrs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "indexmap 1.9.3",
  "md5",
