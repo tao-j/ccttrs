@@ -132,4 +132,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release edit ${{ needs.prepare-release.outputs.tag }} --draft=false
+          gh release edit ${{ needs.prepare-release.outputs.tag }} --draft=false --repo ${{ github.repository }}
