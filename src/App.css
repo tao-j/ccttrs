@@ -235,11 +235,61 @@ select option {
 }
 
 .progress-stats {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 0.5rem 1rem;
   margin-top: 0.75rem;
   font-size: 0.875rem;
   color: #cbd5e1;
+}
+
+.progress-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.progress-stat-value {
+  display: inline-block;
+  color: #e2e8f0;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.progress-stat-label {
+  color: #94a3b8;
+}
+
+.progress-stat-note {
+  color: #fbbf24;
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-stat-value-files {
+  min-width: 4.5rem;
+}
+
+.progress-stat-value-bytes {
+  min-width: 10.5rem;
+  text-align: left;
+}
+
+.progress-stat-value-speed {
+  min-width: 8.5rem;
+}
+
+.progress-stat-value-duration {
+  min-width: 4.75rem;
+}
+
+.progress-stat-percent {
+  justify-content: flex-end;
+}
+
+.progress-stat-value-percent {
+  min-width: 3.25rem;
 }
 
 .current-file {

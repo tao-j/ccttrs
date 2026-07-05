@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-// No longer used dynamically but kept for dependency parity
-use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -169,21 +168,27 @@ pub fn run_sync(
                     }
                 }
 
-                if should_copy {
-                    if let Err(e) = fs::copy(&f.path, &dest_path) {
-                        return Err(e.to_string());
-                    }
-                    let _ = true_bytes_copied.fetch_add(f.size as usize, Ordering::SeqCst);
-                } else {
-                    let _ = skipped_count.fetch_add(1, Ordering::SeqCst);
-                }
-
-                let _ = copied_count.fetch_add(1, Ordering::SeqCst);
-                let _ = bytes_copied.fetch_add(f.size as usize, Ordering::SeqCst);
-
                 if let Ok(mut name_lock) = current_filename.lock() {
                     *name_lock = dest_file_name.clone();
                 }
+
+                if should_copy {
+                    if let Err(e) = copy_file_with_progress(
+                        &f.path,
+                        &dest_path,
+                        &cancel_flag,
+                        &bytes_copied,
+                        &true_bytes_copied,
+                    ) {
+                        let _ = fs::remove_file(&dest_path);
+                        return Err(e);
+                    }
+                } else {
+                    let _ = skipped_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = bytes_copied.fetch_add(f.size as usize, Ordering::SeqCst);
+                }
+
+                let _ = copied_count.fetch_add(1, Ordering::SeqCst);
 
                 Ok(f)
             })
@@ -234,6 +239,40 @@ pub fn run_sync(
         profile.last_file_path = Some(f.name.clone());
         profile.last_file_timestamp = Some(f.modified);
         profile.save_to_sd(sd_root)?;
+    }
+
+    Ok(())
+}
+
+fn copy_file_with_progress(
+    source_path: &Path,
+    dest_path: &Path,
+    cancel_flag: &std::sync::atomic::AtomicBool,
+    bytes_copied: &AtomicUsize,
+    true_bytes_copied: &AtomicUsize,
+) -> Result<(), String> {
+    let mut source = fs::File::open(source_path).map_err(|e| e.to_string())?;
+    let mut dest = fs::File::create(dest_path).map_err(|e| e.to_string())?;
+    let mut buffer = vec![0; 1024 * 1024];
+
+    loop {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Err("Cancelled by user".to_string());
+        }
+
+        let bytes_read = source.read(&mut buffer).map_err(|e| e.to_string())?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        dest.write_all(&buffer[..bytes_read])
+            .map_err(|e| e.to_string())?;
+        let _ = true_bytes_copied.fetch_add(bytes_read, Ordering::SeqCst);
+        let _ = bytes_copied.fetch_add(bytes_read, Ordering::SeqCst);
+    }
+
+    if let Ok(metadata) = fs::metadata(source_path) {
+        let _ = fs::set_permissions(dest_path, metadata.permissions());
     }
 
     Ok(())

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useCallback, useRef, useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { load } from '@tauri-apps/plugin-store';
@@ -43,12 +43,44 @@ interface FileMeta {
   modified: number;
 }
 
+interface SpeedSample {
+  elapsedSecs: number;
+  bytesCopied: number;
+}
+
+interface TransferStats {
+  rollingBytesPerSec: number | null;
+  remainingSecs: number | null;
+}
+
 const formatBytes = (bytes: number) => {
+  if (!Number.isFinite(bytes)) return '0 Bytes';
   if (bytes === 0) return '0 Bytes';
+  if (bytes < 1) return `${bytes.toFixed(2)} Bytes`;
+
   const k = 1024;
   const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+const formatDuration = (totalSeconds: number | null) => {
+  if (totalSeconds === null || !Number.isFinite(totalSeconds)) return "--";
+
+  const seconds = Math.max(0, Math.round(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainingSeconds = seconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+
+  if (minutes > 0) {
+    return `${minutes}m ${remainingSeconds}s`;
+  }
+
+  return `${remainingSeconds}s`;
 };
 
 function CardTask({ 
@@ -63,7 +95,8 @@ function CardTask({
   fileSystem,
   onProfileStatusChange,
   globalStagingDir,
-  onEject
+  onEject,
+  onCopyStatusChange
 }: { 
   sdPath: string, 
   initialVolumeName: string, 
@@ -76,7 +109,8 @@ function CardTask({
   fileSystem?: string,
   onProfileStatusChange?: (sdPath: string, hasProfile: boolean) => void,
   globalStagingDir?: string,
-  onEject?: () => void
+  onEject?: () => void,
+  onCopyStatusChange?: (sdPath: string, isCopying: boolean) => void
 }) {
   const [stagingDir, setStagingDir] = useState("");
   const [profileType, setProfileType] = useState("Sony"); 
@@ -89,6 +123,11 @@ function CardTask({
   const [isCopying, setIsCopying] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [progress, setProgress] = useState<ProgressPayload | null>(null);
+  const [transferStats, setTransferStats] = useState<TransferStats>({
+    rollingBytesPerSec: null,
+    remainingSecs: null,
+  });
+  const speedSamplesRef = useRef<SpeedSample[]>([]);
   const [availableFiles, setAvailableFiles] = useState<FileMeta[]>([]);
   const [selectedStartFile, setSelectedStartFile] = useState<string>("");
   const [isFetchingFiles, setIsFetchingFiles] = useState(false);
@@ -101,6 +140,7 @@ function CardTask({
     listen<ProgressPayload>("copy-progress", (event) => {
       if (event.payload.sd_path === sdPath) {
         setProgress(event.payload);
+        updateTransferStats(event.payload);
         if (event.payload.files_copied + event.payload.files_skipped === event.payload.total_files && event.payload.total_files > 0) {
            setIsCopying(false);
            handleLoadProfile();
@@ -112,6 +152,7 @@ function CardTask({
        if (event.payload === sdPath) {
            setIsCopying(false);
            setProgress(null);
+           resetTransferStats();
            handleLoadProfile();
        }
     }).then(u => unlistenFinished = u);
@@ -123,6 +164,7 @@ function CardTask({
            setIsCopying(false);
            setErrorMsg(parts[1] || "Copy failed");
            setProgress(null);
+           resetTransferStats();
        }
     }).then(u => unlistenError = u);
 
@@ -142,6 +184,58 @@ function CardTask({
       setStagingDir(globalStagingDir);
     }
   }, [globalStagingDir]);
+
+  useEffect(() => {
+    onCopyStatusChange?.(sdPath, isCopying);
+
+    return () => {
+      if (isCopying) {
+        onCopyStatusChange?.(sdPath, false);
+      }
+    };
+  }, [isCopying, onCopyStatusChange, sdPath]);
+
+  function resetTransferStats() {
+    speedSamplesRef.current = [];
+    setTransferStats({
+      rollingBytesPerSec: null,
+      remainingSecs: null,
+    });
+  }
+
+  function updateTransferStats(nextProgress: ProgressPayload) {
+    const currentSample = {
+      elapsedSecs: nextProgress.elapsed_secs,
+      bytesCopied: nextProgress.true_bytes_copied,
+    };
+    const rollingWindowStart = currentSample.elapsedSecs - 5;
+    const samples = [...speedSamplesRef.current, currentSample].filter(
+      sample => sample.elapsedSecs >= rollingWindowStart
+    );
+    const oldestSample = samples[0];
+    const elapsedDelta = oldestSample
+      ? currentSample.elapsedSecs - oldestSample.elapsedSecs
+      : 0;
+    const bytesDelta = oldestSample
+      ? currentSample.bytesCopied - oldestSample.bytesCopied
+      : 0;
+    let rollingBytesPerSec: number | null = null;
+
+    if (elapsedDelta >= 0.5 && bytesDelta >= 0) {
+      rollingBytesPerSec = bytesDelta / elapsedDelta;
+    } else if (currentSample.elapsedSecs > 0.05 && currentSample.bytesCopied > 0) {
+      rollingBytesPerSec = currentSample.bytesCopied / currentSample.elapsedSecs;
+    }
+
+    const remainingBytes = Math.max(0, nextProgress.total_bytes - nextProgress.bytes_copied);
+    const remainingSecs =
+      rollingBytesPerSec && rollingBytesPerSec > 0
+        ? remainingBytes / rollingBytesPerSec
+        : null;
+
+    speedSamplesRef.current = samples;
+    setTransferStats({ rollingBytesPerSec, remainingSecs });
+  }
 
   async function handleLoadProfile() {
     setErrorMsg("");
@@ -245,6 +339,7 @@ function CardTask({
     setErrorMsg("");
     setIsCopying(true);
     setProgress(null);
+    resetTransferStats();
     try {
       await invoke("start_copy", { sdPath, stagingDir });
       // We no longer `setIsCopying(false)` here because Rust returns immediately.
@@ -577,22 +672,48 @@ function CardTask({
           {isCopying && progress && (
             <div className="progress-container">
               <div className="progress-stats">
-                <span>
-                  {progress.files_copied} / {progress.total_files} Files 
-                  {progress.files_skipped > 0 && <span style={{color: '#fbbf24', marginLeft: '6px'}}>({progress.files_skipped} Skipped)</span>}
+                <span className="progress-stat">
+                  <span className="progress-stat-value progress-stat-value-files">
+                    {progress.files_copied} / {progress.total_files}
+                  </span>
+                  <span className="progress-stat-label">Files</span>
+                  {progress.files_skipped > 0 && (
+                    <span className="progress-stat-note">
+                      ({progress.files_skipped} Skipped)
+                    </span>
+                  )}
                 </span>
-                <span>
-                  {formatBytes(progress.bytes_copied)} / {formatBytes(progress.total_bytes)}
+                <span className="progress-stat">
+                  <span className="progress-stat-value progress-stat-value-bytes">
+                    {formatBytes(progress.bytes_copied)} / {formatBytes(progress.total_bytes)}
+                  </span>
                 </span>
-                <span>
-                  {progress.elapsed_secs > 0.05 
-                     ? `${formatBytes(progress.true_bytes_copied / progress.elapsed_secs)}/s` 
-                     : 'Calculating...'}
+                <span className="progress-stat">
+                  <span className="progress-stat-label">Speed:</span>
+                  <span className="progress-stat-value progress-stat-value-speed">
+                    {transferStats.rollingBytesPerSec !== null
+                      ? `${formatBytes(transferStats.rollingBytesPerSec)}/s`
+                      : 'Calculating...'}
+                  </span>
                 </span>
-                <span>
-                  {progress.total_bytes > 0 
-                    ? `${Math.round((progress.bytes_copied / progress.total_bytes) * 100)}%` 
-                    : '0%'}
+                <span className="progress-stat">
+                  <span className="progress-stat-label">Elapsed:</span>
+                  <span className="progress-stat-value progress-stat-value-duration">
+                    {formatDuration(progress.elapsed_secs)}
+                  </span>
+                </span>
+                <span className="progress-stat">
+                  <span className="progress-stat-label">Remaining:</span>
+                  <span className="progress-stat-value progress-stat-value-duration">
+                    {formatDuration(transferStats.remainingSecs)}
+                  </span>
+                </span>
+                <span className="progress-stat progress-stat-percent">
+                  <span className="progress-stat-value progress-stat-value-percent">
+                    {progress.total_bytes > 0
+                      ? `${Math.round((progress.bytes_copied / progress.total_bytes) * 100)}%`
+                      : '0%'}
+                  </span>
                 </span>
               </div>
               <div className="progress-bar-bg">
@@ -620,12 +741,34 @@ function App() {
   const [store, setStore] = useState<any>(null);
   const [profileStatuses, setProfileStatuses] = useState<Record<string, boolean>>({});
   const [globalStagingDir, setGlobalStagingDir] = useState("");
+  const activeCopyPathsRef = useRef<string[]>([]);
+  const [isRefreshingDevices, setIsRefreshingDevices] = useState(false);
+
+  const handleCopyStatusChange = useCallback((path: string, copying: boolean) => {
+    const activeCopyPaths = activeCopyPathsRef.current;
+
+    activeCopyPathsRef.current = copying
+      ? (activeCopyPaths.includes(path) ? activeCopyPaths : [...activeCopyPaths, path])
+      : activeCopyPaths.filter(activePath => activePath !== path);
+  }, []);
+
+  const setRefreshedDevices = useCallback((found: DeviceInfo[]) => {
+    setDevices(prev => {
+      const refreshedPaths = new Set(found.map(device => device.mount_point));
+      const activeDevicesMissingFromRefresh = activeCopyPathsRef.current
+        .filter(path => !refreshedPaths.has(path))
+        .map(path => prev.find(device => device.mount_point === path))
+        .filter((device): device is DeviceInfo => Boolean(device));
+
+      return [...found, ...activeDevicesMissingFromRefresh];
+    });
+  }, []);
 
   useEffect(() => {
     async function init() {
       try {
         const found = await invoke<DeviceInfo[]>("list_devices");
-        setDevices(found);
+        setRefreshedDevices(found);
       } catch (err) { console.error("Failed to list devices", err); }
 
       try {
@@ -642,7 +785,7 @@ function App() {
       } catch (err) { console.error("Failed to load store", err); }
     }
     init();
-  }, []);
+  }, [setRefreshedDevices]);
 
   // Update recent dirs globally when any task saves it
   useEffect(() => {
@@ -682,10 +825,12 @@ function App() {
   };
 
   async function handleRefresh() {
+    setIsRefreshingDevices(true);
     try {
       const found = await invoke<DeviceInfo[]>("list_devices");
-      setDevices(found);
+      setRefreshedDevices(found);
     } catch (err) { console.error("Failed to refresh devices", err); }
+    finally { setIsRefreshingDevices(false); }
   }
 
   async function handleEject(mountPoint: string) {
@@ -725,11 +870,12 @@ function App() {
           {/* Refresh button */}
           <button
             onClick={handleRefresh}
-            title="Rescan for new drives"
-            style={{ background: 'rgba(56,189,248,0.15)', border: '1px solid rgba(56,189,248,0.4)', color: '#38bdf8', borderRadius: '8px', padding: '0.4rem 0.75rem', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85rem' }}
+            disabled={isRefreshingDevices}
+            title={isRefreshingDevices ? "Refreshing drives" : "Rescan for new drives"}
+            style={{ background: 'rgba(56,189,248,0.15)', border: '1px solid rgba(56,189,248,0.4)', color: '#38bdf8', borderRadius: '8px', padding: '0.4rem 0.75rem', cursor: isRefreshingDevices ? 'wait' : 'pointer', opacity: isRefreshingDevices ? 0.65 : 1, display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85rem' }}
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-            Refresh Drives
+            {isRefreshingDevices ? "Refreshing..." : "Refresh Drives"}
           </button>
         </div>
         <div className="form-group" style={{ marginBottom: 0 }}>
@@ -790,6 +936,7 @@ function App() {
              onProfileStatusChange={handleProfileStatusChange}
              globalStagingDir={globalStagingDir}
              onEject={() => handleEject(task.path)}
+             onCopyStatusChange={handleCopyStatusChange}
            />
         ))}
       </div>
