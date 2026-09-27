@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -110,6 +110,7 @@ pub fn run_sync(
     let bytes_copied = Arc::new(AtomicUsize::new(0)); // Visual progress bar
     let true_bytes_copied = Arc::new(AtomicUsize::new(0)); // Actual physical io metrics
     let current_filename = Arc::new(Mutex::new(String::new()));
+    let current_destination_path = Arc::new(Mutex::new(None::<PathBuf>));
     let start_time = Instant::now();
     let is_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -119,6 +120,7 @@ pub fn run_sync(
         let reporter_bytes_copied = bytes_copied.clone();
         let reporter_true_bytes = true_bytes_copied.clone();
         let reporter_current_filename = current_filename.clone();
+        let reporter_current_destination_path = current_destination_path.clone();
         let reporter_is_done = is_done.clone();
         let on_progress_ref = &on_progress;
 
@@ -126,8 +128,20 @@ pub fn run_sync(
             while !reporter_is_done.load(Ordering::Relaxed) {
                 let current_count = reporter_copied_count.load(Ordering::Relaxed);
                 let current_skipped = reporter_skipped_count.load(Ordering::Relaxed);
-                let current_bytes = reporter_bytes_copied.load(Ordering::Relaxed);
-                let current_true = reporter_true_bytes.load(Ordering::Relaxed);
+                let completed_bytes = reporter_bytes_copied.load(Ordering::Relaxed);
+                let completed_true = reporter_true_bytes.load(Ordering::Relaxed);
+                let current_file_bytes = reporter_current_destination_path
+                    .lock()
+                    .ok()
+                    .and_then(|path_lock| {
+                        path_lock
+                            .as_ref()
+                            .and_then(|path| fs::metadata(path).ok())
+                            .map(|metadata| metadata.len() as usize)
+                    })
+                    .unwrap_or(0);
+                let current_bytes = (completed_bytes + current_file_bytes).min(total_bytes);
+                let current_true = (completed_true + current_file_bytes).min(total_bytes);
                 let filename = reporter_current_filename.lock().unwrap().clone();
 
                 on_progress_ref(CopyProgress {
@@ -173,15 +187,26 @@ pub fn run_sync(
                 }
 
                 if should_copy {
-                    if let Err(e) = copy_file_with_progress(
-                        &f.path,
-                        &dest_path,
-                        &cancel_flag,
-                        &bytes_copied,
-                        &true_bytes_copied,
-                    ) {
-                        let _ = fs::remove_file(&dest_path);
-                        return Err(e);
+                    if let Ok(mut path_lock) = current_destination_path.lock() {
+                        *path_lock = Some(dest_path.clone());
+                    }
+
+                    let copy_result = copy_file_preserving_modified(&f.path, &dest_path);
+
+                    if let Ok(mut path_lock) = current_destination_path.lock() {
+                        *path_lock = None;
+                    }
+
+                    match copy_result {
+                        Ok(copied_bytes) => {
+                            let copied_bytes = copied_bytes as usize;
+                            let _ = true_bytes_copied.fetch_add(copied_bytes, Ordering::SeqCst);
+                            let _ = bytes_copied.fetch_add(copied_bytes, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            let _ = fs::remove_file(&dest_path);
+                            return Err(e.to_string());
+                        }
                     }
                 } else {
                     let _ = skipped_count.fetch_add(1, Ordering::SeqCst);
@@ -244,38 +269,22 @@ pub fn run_sync(
     Ok(())
 }
 
-fn copy_file_with_progress(
-    source_path: &Path,
-    dest_path: &Path,
-    cancel_flag: &std::sync::atomic::AtomicBool,
-    bytes_copied: &AtomicUsize,
-    true_bytes_copied: &AtomicUsize,
-) -> Result<(), String> {
-    let mut source = fs::File::open(source_path).map_err(|e| e.to_string())?;
-    let mut dest = fs::File::create(dest_path).map_err(|e| e.to_string())?;
-    let mut buffer = vec![0; 1024 * 1024];
+fn copy_file_preserving_modified(source_path: &Path, dest_path: &Path) -> std::io::Result<u64> {
+    // FileMeta stores whole seconds for sorting; retain the filesystem's full precision here.
+    let modified = fs::metadata(source_path)?.modified()?;
+    let copied_bytes = fs::copy(source_path, dest_path)?;
 
-    loop {
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err("Cancelled by user".to_string());
-        }
-
-        let bytes_read = source.read(&mut buffer).map_err(|e| e.to_string())?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        dest.write_all(&buffer[..bytes_read])
-            .map_err(|e| e.to_string())?;
-        let _ = true_bytes_copied.fetch_add(bytes_read, Ordering::SeqCst);
-        let _ = bytes_copied.fetch_add(bytes_read, Ordering::SeqCst);
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Updating timestamps requires FILE_WRITE_ATTRIBUTES, even for read-only media.
+        options.access_mode(0x0100);
     }
+    options.open(dest_path)?.set_modified(modified)?;
 
-    if let Ok(metadata) = fs::metadata(source_path) {
-        let _ = fs::set_permissions(dest_path, metadata.permissions());
-    }
-
-    Ok(())
+    Ok(copied_bytes)
 }
 
 #[allow(dead_code)]
@@ -610,6 +619,80 @@ mod tests {
         assert_eq!(names, vec!["A001C001.MP4", "A001C001.NEV"]);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_preserves_original_modified_time() {
+        for (profile_type, source_name, dest_name, conflict, read_only) in [
+            ("Sony", "A001C001.JPG", "A001C001.JPG", false, false),
+            ("Nikon", "A001C001.NEV", "A001C001.R3D", false, false),
+            ("Nikon", "A001C001.NEV", "A001C001.R3D", true, false),
+            ("Sony", "A001C001.JPG", "A001C001.JPG", false, true),
+        ] {
+            let root = make_temp_card("preserve_modified");
+            let dcim = root.join("DCIM");
+            let staging = root.join("staging");
+            fs::create_dir_all(&dcim).unwrap();
+            fs::create_dir_all(&staging).unwrap();
+            let source = dcim.join(source_name);
+            write_file(&source);
+            let original_permissions = fs::metadata(&source).unwrap().permissions();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&source)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::new(1_600_000_000, 123_456_700))
+                .unwrap();
+            let modified = fs::metadata(&source).unwrap().modified().unwrap();
+            if read_only {
+                let mut permissions = original_permissions.clone();
+                permissions.set_readonly(true);
+                fs::set_permissions(&source, permissions).unwrap();
+            }
+            let existing = staging.join(dest_name);
+            if conflict {
+                fs::write(&existing, b"existing file with different size").unwrap();
+            }
+
+            let mut profile = profile(profile_type, true);
+            profile.staging_dir = staging.to_string_lossy().into_owned();
+            run_sync(
+                &root,
+                &mut profile,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+
+            let destinations: Vec<_> = fs::read_dir(&staging)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| !conflict || path != &existing)
+                .collect();
+            assert_eq!(destinations.len(), 1);
+            let destination = &destinations[0];
+            assert_eq!(fs::read(destination).unwrap(), b"test");
+            assert_eq!(
+                fs::metadata(destination).unwrap().modified().unwrap(),
+                modified
+            );
+            assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), modified);
+            if conflict {
+                assert_eq!(
+                    fs::read(&existing).unwrap(),
+                    b"existing file with different size"
+                );
+                assert_eq!(destination.extension().unwrap(), "R3D");
+            } else {
+                assert_eq!(destination, &existing);
+            }
+            if read_only {
+                assert!(fs::metadata(destination).unwrap().permissions().readonly());
+                fs::set_permissions(&source, original_permissions.clone()).unwrap();
+                fs::set_permissions(destination, original_permissions).unwrap();
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     fn make_temp_card(prefix: &str) -> PathBuf {
